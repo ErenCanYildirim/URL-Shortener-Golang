@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Local development files
+.env
+.env.local
+
+# Database files (we'll mount these as volumes)
+*.db
+*.db-journal
+
+# Go build artifacts
+url-shortener
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
