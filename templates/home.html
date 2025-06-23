@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>URL Shortener</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .container { background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .result { background: #d4edda; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .error { background: #f8d7da; padding: 15px; border-radius: 4px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>URL Shortener</h1>
+    <div class="container">
+        <h2>Shorten a URL</h2>
+        <input type="text" id="urlInput" placeholder="Enter a URL to shorten...">
+        <button onclick="shortenUrl()">Shorten URL</button>
+        <div id="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>API Endpoints</h2>
+        <ul>
+            <li><strong>POST /api/shorten</strong> - Shorten a URL</li>
+            <li><strong>GET /{shortCode}</strong> - Redirect to original URL</li>
+            <li><strong>GET /api/stats/{shortCode}</strong> - Get URL statistics</li>
+            <li><strong>GET /api/list</strong> - List all URLs (limit parameter supported)</li>
+        </ul>
+    </div>
+
+    <script>
+        async function shortenUrl() {
+            const url = document.getElementById('urlInput').value;
+            const resultDiv = document.getElementById('result');
+            
+            if (!url) {
+                resultDiv.innerHTML = '<div class="error">Please enter a URL</div>';
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/shorten', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.innerHTML = '<div class="result">Short URL: <a href="' + data.short_url + '" target="_blank">' + data.short_url + '</a></div>';
+                } else {
+                    resultDiv.innerHTML = '<div class="error">Error: ' + (data.error || 'Unknown error') + '</div>';
+                }
+            } catch (error) {
+                resultDiv.innerHTML = '<div class="error">Error: ' + error.message + '</div>';
+            }
+        }
+
+        document.getElementById('urlInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                shortenUrl();
+            }
+        });
+    </script>
+</body>
+</html>
