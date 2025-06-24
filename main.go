@@ -154,23 +154,17 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 		}
 	}
 
-	result, err := us.db.Exec("INSERT INTO urls (short_code, long_url) VALUES ($1, $2)", shortCode, longURL)
+	var newURL URL
+	err = us.db.QueryRow(
+		"INSERT INTO urls (short_code, long_url) VALUES ($1, $2) RETURNING id, short_code, long_url, clicks, created_at",
+		shortCode, longURL,
+	).Scan(&newURL.ID, &newURL.ShortCode, &newURL.LongURL, &newURL.Clicks, &newURL.CreatedAt)
+
 	if err != nil {
 		return nil, err
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		return nil, err
-	}
-
-	return &URL{
-		ID:        int(id),
-		ShortCode: shortCode,
-		LongURL:   longURL,
-		Clicks:    0,
-		CreatedAt: time.Now(),
-	}, nil
+	return &newURL, nil
 }
 
 func (us *URLShortener) GetURL(shortCode string) (*URL, error) {
