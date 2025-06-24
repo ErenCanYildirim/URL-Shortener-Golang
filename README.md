@@ -1,8 +1,16 @@
 # URL-Shortener-Golang
 
-URL-Shortener service built with golang.
+Production ready URL-Shortener service built with golang.
 
-Install the go mod dependencies.
-Change the localhost to desired url if not deploying on a container.
+If you want to run it locally as a playground then switch to the local branch, it uses sqlite.
 
-Start via docker-compose up or go run main.go
+The main branch uses postgresql with connection pooling to ensure prod-grade stability.
+
+How to run:
+    1. Create an .env file with POSTGRES_PASSWORD, POSTGRES_PORT, APP_PORT
+    2. Start with ```bash
+        docker-compose up --build
+    ```
+
+Missing:
+    -> Transaction safety for some db-operations

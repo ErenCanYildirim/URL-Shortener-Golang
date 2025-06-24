@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	_ "modernc.org/sqlite"
+	_ "github.com/lib/pq"
 )
 
 type URL struct {
@@ -38,11 +38,19 @@ type URLShortener struct {
 	db *sql.DB
 }
 
-func NewURLShortener(dbPath string) (*URLShortener, error) {
-	db, err := sql.Open("sqlite", dbPath)
+func NewURLShortener(dbURL string) (*URLShortener, error) {
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, err
 	}
+
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	us := &URLShortener{db: db}
 	if err := us.createTables(); err != nil {
@@ -55,22 +63,29 @@ func (us *URLShortener) createTables() error {
 
 	urlsTable := `
 	CREATE TABLE IF NOT EXISTS urls (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		short_code TEXT UNIQUE NOT NULL,
 		long_url TEXT NOT NULL,
 		clicks INTEGER DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	analyticsTable := `
 	CREATE TABLE IF NOT EXISTS analytics (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id SERIAL PRIMARY KEY,
 		short_code TEXT NOT NULL,
 		ip_address TEXT,
 		user_agent TEXT,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (short_code) REFERENCES urls(short_code)
 	);`
+
+	indexQueries := []string{
+		`CREATE INDEX IF NOT EXISTS idx_urls_short_code ON urls(short_code);`,
+		`CREATE INDEX IF NOT EXISTS idx_urls_created_at ON urls(created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_short_code ON analytics(short_code);`,
+		`CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics(timestamp DESC);`,
+	}
 
 	if _, err := us.db.Exec(urlsTable); err != nil {
 		return err
@@ -78,6 +93,12 @@ func (us *URLShortener) createTables() error {
 
 	if _, err := us.db.Exec(analyticsTable); err != nil {
 		return err
+	}
+
+	for _, query := range indexQueries {
+		if _, err := us.db.Exec(query); err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
 	}
 
 	return nil
@@ -108,7 +129,7 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 	}
 
 	var existingURL URL
-	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE long_url = ?", longURL).
+	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE long_url = $1", longURL).
 		Scan(&existingURL.ID, &existingURL.ShortCode, &existingURL.LongURL, &existingURL.Clicks, &existingURL.CreatedAt)
 
 	if err == nil {
@@ -124,7 +145,7 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 		}
 
 		var count int
-		err = us.db.QueryRow("SELECT COUNT(*) FROM urls WHERE short_code = ?", shortCode).Scan(&count)
+		err = us.db.QueryRow("SELECT COUNT(*) FROM urls WHERE short_code = $1", shortCode).Scan(&count)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +154,7 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 		}
 	}
 
-	result, err := us.db.Exec("INSERT INTO urls (short_code, long_url) VALUES (?, ?)", shortCode, longURL)
+	result, err := us.db.Exec("INSERT INTO urls (short_code, long_url) VALUES ($1, $2)", shortCode, longURL)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +175,7 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 
 func (us *URLShortener) GetURL(shortCode string) (*URL, error) {
 	var urlRecord URL
-	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE short_code = ?", shortCode).
+	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE short_code = $1", shortCode).
 		Scan(&urlRecord.ID, &urlRecord.ShortCode, &urlRecord.LongURL, &urlRecord.Clicks, &urlRecord.CreatedAt)
 
 	if err != nil {
@@ -168,20 +189,20 @@ func (us *URLShortener) GetURL(shortCode string) (*URL, error) {
 }
 
 func (us *URLShortener) IncrementClick(shortCode, ipAddress, userAgent string) error {
-	_, err := us.db.Exec("UPDATE urls SET clicks = clicks + 1 WHERE short_code = ?", shortCode)
+	_, err := us.db.Exec("UPDATE urls SET clicks = clicks + 1 WHERE short_code = $1", shortCode)
 
 	if err != nil {
 		return err
 	}
 
-	_, err = us.db.Exec("INSERT INTO analytics (short_code, ip_address, user_agent) VALUES (?, ?, ?)",
+	_, err = us.db.Exec("INSERT INTO analytics (short_code, ip_address, user_agent) VALUES ($1, $2, $3)",
 		shortCode, ipAddress, userAgent)
 
 	return err
 }
 
 func (us *URLShortener) GetAnalytics(shortCode string) ([]AnalyticsRecord, error) {
-	rows, err := us.db.Query("SELECT id, short_code, ip_address, user_agent, timestamp FROM analytics WHERE short_code = ? ORDER BY timestamp DESC", shortCode)
+	rows, err := us.db.Query("SELECT id, short_code, ip_address, user_agent, timestamp FROM analytics WHERE short_code = $1 ORDER BY timestamp DESC", shortCode)
 
 	if err != nil {
 		return nil, err
@@ -282,7 +303,7 @@ func (us *URLShortener) statsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = us.db.QueryRow("SELECT clicks FROM urls WHERE short_code = ?", shortCode).Scan(&urlRecord.Clicks)
+	err = us.db.QueryRow("SELECT clicks FROM urls WHERE short_code = $1", shortCode).Scan(&urlRecord.Clicks)
 	if err != nil {
 		http.Error(w, "Error retrieving stats", http.StatusInternalServerError)
 		return
@@ -312,7 +333,7 @@ func (us *URLShortener) listHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rows, err := us.db.Query("SELECT id, short_code, long_url, clicks, created_at FROM urls ORDER BY created_at DESC LIMIT ?", limit)
+	rows, err := us.db.Query("SELECT id, short_code, long_url, clicks, created_at FROM urls ORDER BY created_at DESC LIMIT $1", limit)
 	if err != nil {
 		http.Error(w, "Error retrieving URLs", http.StatusInternalServerError)
 		return
@@ -337,6 +358,15 @@ func (us *URLShortener) listHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	html, err := os.ReadFile("templates/home.html")
 	if err != nil {
@@ -350,7 +380,12 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	shortener, err := NewURLShortener("urls.db")
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
+
+	shortener, err := NewURLShortener(dbURL)
 
 	if err != nil {
 		log.Fatal("Failed to initialize URL shortener:", err)
@@ -359,12 +394,19 @@ func main() {
 
 	r := mux.NewRouter()
 
+	r.HandleFunc("/health", healthHandler).Methods("GET")
+
 	r.HandleFunc("/", homeHandler).Methods("GET")
 
 	r.HandleFunc("/api/shorten", shortener.shortenHandler).Methods("POST")
 	r.HandleFunc("/api/stats/{shortCode}", shortener.statsHandler).Methods("GET")
 	r.HandleFunc("/api/list", shortener.listHandler).Methods("GET")
 	r.HandleFunc("/{shortCode}", shortener.redirectHandler).Methods("GET")
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
 	fmt.Println("URL Shortener started on http://localhost:8080")
 	fmt.Println("Visit http://localhost:8080 for the web interface")

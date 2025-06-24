@@ -1,33 +1,38 @@
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24.4-alpine AS builder
+
+RUN apk add --no-cache git wget
 
 WORKDIR /app
-
-RUN apk add --no-cache git 
 
 COPY go.mod go.sum ./
 
-RUN go mod download 
+RUN go mod download
 
-COPY main.go .
+COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o url-shortener .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
 
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates wget 
 
-RUN addgroup -g 1001 -S appgroup && \
-    adduser -u 1001 -S appuser -G appgroup    
+WORKDIR /app/
 
-WORKDIR /app
+COPY --from=builder /app/main .
+COPY --from=builder /app/templates ./templates
 
-COPY --from=builder /app/url-shortener .
+RUN adduser -D -s /bin/sh appuser
 
-RUN mkdir -p /app/data && chown -R appuser:appgroup /app
+RUN chown -R appuser:appuser /app/templates
+
+RUN find /app/templates -type d -exec chmod 755 {} \; && \
+    find /app/templates -type f -exec chmod 644 {} \;
 
 USER appuser
 
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:8080/health || exit 1
 
-CMD ["./url-shortener"]
+CMD ["./main"]
