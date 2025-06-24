@@ -11,6 +11,22 @@ How to run:
     2. Start with ```bash
         docker-compose up --build
     ```
+API:
+
+**HTTP Method:** `GET`
+**URL Path:** `/health`
+
+**HTTP Method:** `GET`
+**URL Path:** `/api/stats/{shortCode}`
+
+**HTTP Method:** `GET`
+**URL Path:** `/api/list`
+
+**HTTP Method:** `GET`
+**URL Path:** `/{shortCode}`
+
+**HTTP Method:** `POST`
+**URL Path:** `/api/shorten`
 
 Missing:
     -> Transaction safety for some db-operations
