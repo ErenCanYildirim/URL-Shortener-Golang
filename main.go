@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -34,8 +36,18 @@ type AnalyticsRecord struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+type AnalyticsEvent struct {
+	ShortCode string
+	IPAddress string
+	UserAgent string
+	Timestamp time.Time
+}
+
 type URLShortener struct {
-	db *sql.DB
+	db               *sql.DB
+	analyticsChannel chan AnalyticsEvent
+	cache            sync.Map
+	wg               sync.WaitGroup
 }
 
 func NewURLShortener(dbURL string) (*URLShortener, error) {
@@ -48,14 +60,21 @@ func NewURLShortener(dbURL string) (*URLShortener, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(15)
+	db.SetConnMaxLifetime(10 * time.Minute)
 
-	us := &URLShortener{db: db}
+	us := &URLShortener{
+		db:               db,
+		analyticsChannel: make(chan AnalyticsEvent, 1000),
+	}
+
 	if err := us.createTables(); err != nil {
 		return nil, err
 	}
+
+	go us.analyticsWorker()
+
 	return us, nil
 }
 
@@ -83,6 +102,7 @@ func (us *URLShortener) createTables() error {
 	indexQueries := []string{
 		`CREATE INDEX IF NOT EXISTS idx_urls_short_code ON urls(short_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_urls_created_at ON urls(created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_urls_long_url ON urls(long_url);`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_short_code ON analytics(short_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics(timestamp DESC);`,
 	}
@@ -104,12 +124,76 @@ func (us *URLShortener) createTables() error {
 	return nil
 }
 
+func (us *URLShortener) analyticsWorker() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	batch := make([]AnalyticsEvent, 0, 50)
+
+	for {
+		select {
+		case event := <-us.analyticsChannel:
+			batch = append(batch, event)
+			if len(batch) >= 50 {
+				us.processBatch(batch)
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				us.processBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func (us *URLShortener) processBatch(events []AnalyticsEvent) {
+	if len(events) == 0 {
+		return
+	}
+
+	tx, err := us.db.Begin()
+	if err != nil {
+		log.Printf("Error starting analytics transaction: %v", err)
+		return
+	}
+	defer tx.Rollback()
+
+	updateStmt, err := tx.Prepare("UPDATE urls SET clicks = clicks + 1 WHERE short_code = $1")
+	if err != nil {
+		log.Printf("Error preparing update statement: %v", err)
+		return
+	}
+	defer updateStmt.Close()
+
+	insertStmt, err := tx.Prepare("INSERT INTO analytics (short_code, ip_address, user_agent, timestamp) VALUES ($1, $2, $3, $4)")
+	if err != nil {
+		log.Printf("Error preparing insert statement: %v", err)
+		return
+	}
+	defer insertStmt.Close()
+
+	for _, event := range events {
+		if _, err := updateStmt.Exec(event.ShortCode); err != nil {
+			log.Printf("Error updating clicks for %s: %v", event.ShortCode, err)
+			continue
+		}
+
+		if _, err := insertStmt.Exec(event.ShortCode, event.IPAddress, event.UserAgent, event.Timestamp); err != nil {
+			log.Printf("Error inserting analytics for %s: %v", event.ShortCode, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing analytics batch: %v", err)
+	}
+}
+
 func generateShortCode(length int) (string, error) {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	result := make([]byte, length)
 
 	for i := range result {
-		num, err := rand.Int(rand.Reader, big.NewInt((int64(len(charset)))))
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
 		if err != nil {
 			return "", err
 		}
@@ -118,44 +202,58 @@ func generateShortCode(length int) (string, error) {
 	return string(result), nil
 }
 
+func (us *URLShortener) generateUniqueShortCode(ctx context.Context) (string, error) {
+	maxAttempts := 10
+	startLength := 6
+
+	for length := startLength; length <= startLength+2; length++ {
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			shortCode, err := generateShortCode(length)
+			if err != nil {
+				return "", err
+			}
+
+			var count int
+			err = us.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM urls WHERE short_code = $1", shortCode).Scan(&count)
+			if err != nil {
+				return "", err
+			}
+			if count == 0 {
+				return shortCode, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("failed to generate unique short code after multiple attempts")
+}
+
 func isValidURL(str string) bool {
 	u, err := url.Parse(str)
 	return err == nil && u.Scheme != "" && u.Host != ""
 }
 
-func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
+func (us *URLShortener) ShortenURL(ctx context.Context, longURL string) (*URL, error) {
 	if !isValidURL(longURL) {
 		return nil, fmt.Errorf("invalid URL format")
 	}
 
+	//Use index on long_url to check for existing url
 	var existingURL URL
-	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE long_url = $1", longURL).
-		Scan(&existingURL.ID, &existingURL.ShortCode, &existingURL.LongURL, &existingURL.Clicks, &existingURL.CreatedAt)
+	err := us.db.QueryRowContext(ctx,
+		"SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE long_url = $1",
+		longURL).Scan(&existingURL.ID, &existingURL.ShortCode, &existingURL.LongURL, &existingURL.Clicks, &existingURL.CreatedAt)
 
 	if err == nil {
+		us.cache.Store(existingURL.ShortCode, &existingURL)
 		return &existingURL, nil
 	}
 
-	//the below solution might not be the most efficient one?
-	var shortCode string
-	for {
-		shortCode, err = generateShortCode(6)
-		if err != nil {
-			return nil, err
-		}
-
-		var count int
-		err = us.db.QueryRow("SELECT COUNT(*) FROM urls WHERE short_code = $1", shortCode).Scan(&count)
-		if err != nil {
-			return nil, err
-		}
-		if count == 0 {
-			break
-		}
+	shortCode, err := us.generateUniqueShortCode(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	var newURL URL
-	err = us.db.QueryRow(
+	err = us.db.QueryRowContext(ctx,
 		"INSERT INTO urls (short_code, long_url) VALUES ($1, $2) RETURNING id, short_code, long_url, clicks, created_at",
 		shortCode, longURL,
 	).Scan(&newURL.ID, &newURL.ShortCode, &newURL.LongURL, &newURL.Clicks, &newURL.CreatedAt)
@@ -164,13 +262,21 @@ func (us *URLShortener) ShortenURL(longURL string) (*URL, error) {
 		return nil, err
 	}
 
+	us.cache.Store(newURL.ShortCode, &newURL)
 	return &newURL, nil
 }
 
-func (us *URLShortener) GetURL(shortCode string) (*URL, error) {
+func (us *URLShortener) GetURL(ctx context.Context, shortCode string) (*URL, error) {
+	if cached, ok := us.cache.Load(shortCode); ok {
+		if urlRecord, ok := cached.(*URL); ok {
+			return urlRecord, nil
+		}
+	}
+
 	var urlRecord URL
-	err := us.db.QueryRow("SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE short_code = $1", shortCode).
-		Scan(&urlRecord.ID, &urlRecord.ShortCode, &urlRecord.LongURL, &urlRecord.Clicks, &urlRecord.CreatedAt)
+	err := us.db.QueryRowContext(ctx,
+		"SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE short_code = $1",
+		shortCode).Scan(&urlRecord.ID, &urlRecord.ShortCode, &urlRecord.LongURL, &urlRecord.Clicks, &urlRecord.CreatedAt)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -179,29 +285,36 @@ func (us *URLShortener) GetURL(shortCode string) (*URL, error) {
 		return nil, err
 	}
 
+	us.cache.Store(shortCode, &urlRecord)
 	return &urlRecord, nil
 }
 
-func (us *URLShortener) IncrementClick(shortCode, ipAddress, userAgent string) error {
-	_, err := us.db.Exec("UPDATE urls SET clicks = clicks + 1 WHERE short_code = $1", shortCode)
-
-	if err != nil {
-		return err
+func (us *URLShortener) RecordAnalytics(shortCode, ipAddress, userAgent string) {
+	event := AnalyticsEvent{
+		ShortCode: shortCode,
+		IPAddress: ipAddress,
+		UserAgent: userAgent,
+		Timestamp: time.Now(),
 	}
 
-	_, err = us.db.Exec("INSERT INTO analytics (short_code, ip_address, user_agent) VALUES ($1, $2, $3)",
-		shortCode, ipAddress, userAgent)
+	select {
+	case us.analyticsChannel <- event:
+		//successful enqueueing
+	default:
+		//channel is full, drop (later add some fallback here)
+		log.Printf("Analytics channel full, dropping event for %s", shortCode)
+	}
 
-	return err
 }
 
-func (us *URLShortener) GetAnalytics(shortCode string) ([]AnalyticsRecord, error) {
-	rows, err := us.db.Query("SELECT id, short_code, ip_address, user_agent, timestamp FROM analytics WHERE short_code = $1 ORDER BY timestamp DESC", shortCode)
+func (us *URLShortener) GetAnalytics(ctx context.Context, shortCode string) ([]AnalyticsRecord, error) {
+	rows, err := us.db.QueryContext(ctx,
+		"SELECT id, short_code, ip_address, user_agent, timestamp FROM analytics WHERE short_code = $1 ORDER BY timestamp DESC LIMIT 1000",
+		shortCode)
 
 	if err != nil {
 		return nil, err
 	}
-
 	defer rows.Close()
 
 	var analytics []AnalyticsRecord
@@ -214,7 +327,7 @@ func (us *URLShortener) GetAnalytics(shortCode string) ([]AnalyticsRecord, error
 		analytics = append(analytics, record)
 	}
 
-	return analytics, nil
+	return analytics, rows.Err()
 }
 
 //HTTP handlers
@@ -224,6 +337,9 @@ func (us *URLShortener) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
 	var request struct {
 		URL string `json:"url"`
@@ -239,8 +355,12 @@ func (us *URLShortener) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	urlRecord, err := us.ShortenURL(request.URL)
+	urlRecord, err := us.ShortenURL(ctx, request.URL)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			http.Error(w, "Request timeout", http.StatusRequestTimeout)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -255,6 +375,9 @@ func (us *URLShortener) shortenHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (us *URLShortener) redirectHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
 	vars := mux.Vars(r)
 	shortCode := vars["shortCode"]
 
@@ -263,8 +386,12 @@ func (us *URLShortener) redirectHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	urlRecord, err := us.GetURL(shortCode)
+	urlRecord, err := us.GetURL(ctx, shortCode)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			http.Error(w, "Request timeout", http.StatusRequestTimeout)
+			return
+		}
 		http.Error(w, "Short URL not found", http.StatusNotFound)
 		return
 	}
@@ -275,14 +402,15 @@ func (us *URLShortener) redirectHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	userAgent := r.UserAgent()
 
-	if err := us.IncrementClick(shortCode, ipAddress, userAgent); err != nil {
-		log.Printf("Error recording analytics: %v", err)
-	}
+	us.RecordAnalytics(shortCode, ipAddress, userAgent)
 
 	http.Redirect(w, r, urlRecord.LongURL, http.StatusMovedPermanently)
 }
 
 func (us *URLShortener) statsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	vars := mux.Vars(r)
 	shortCode := vars["shortCode"]
 
@@ -291,20 +419,32 @@ func (us *URLShortener) statsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	urlRecord, err := us.GetURL(shortCode)
+	urlRecord, err := us.GetURL(ctx, shortCode)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			http.Error(w, "Request timeout", http.StatusRequestTimeout)
+			return
+		}
 		http.Error(w, "Short URL not found", http.StatusNotFound)
 		return
 	}
 
-	err = us.db.QueryRow("SELECT clicks FROM urls WHERE short_code = $1", shortCode).Scan(&urlRecord.Clicks)
+	err = us.db.QueryRowContext(ctx, "SELECT clicks FROM urls WHERE short_code = $1", shortCode).Scan(&urlRecord.Clicks)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			http.Error(w, "Request timeout", http.StatusRequestTimeout)
+			return
+		}
 		http.Error(w, "Error retrieving stats", http.StatusInternalServerError)
 		return
 	}
 
-	analytics, err := us.GetAnalytics(shortCode)
+	analytics, err := us.GetAnalytics(ctx, shortCode)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			http.Error(w, "Request timeout", http.StatusRequestTimeout)
+			return
+		}
 		http.Error(w, "Error retrieving analytics", http.StatusInternalServerError)
 		return
 	}
@@ -373,6 +513,13 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(html))
 }
 
+func (us *URLShortener) Close() error {
+	close(us.analyticsChannel)
+	us.wg.Wait()
+
+	return us.db.Close()
+}
+
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -380,18 +527,15 @@ func main() {
 	}
 
 	shortener, err := NewURLShortener(dbURL)
-
 	if err != nil {
 		log.Fatal("Failed to initialize URL shortener:", err)
 	}
-	defer shortener.db.Close()
+	defer shortener.Close()
 
 	r := mux.NewRouter()
 
 	r.HandleFunc("/health", healthHandler).Methods("GET")
-
 	r.HandleFunc("/", homeHandler).Methods("GET")
-
 	r.HandleFunc("/api/shorten", shortener.shortenHandler).Methods("POST")
 	r.HandleFunc("/api/stats/{shortCode}", shortener.statsHandler).Methods("GET")
 	r.HandleFunc("/api/list", shortener.listHandler).Methods("GET")
@@ -402,7 +546,15 @@ func main() {
 		port = "8080"
 	}
 
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	fmt.Println("URL Shortener started on http://localhost:8080")
 	fmt.Println("Visit http://localhost:8080 for the web interface")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(server.ListenAndServe())
 }

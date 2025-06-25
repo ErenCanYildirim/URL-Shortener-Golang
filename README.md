@@ -11,6 +11,13 @@ How to run:
     2. Start with ```bash
         docker-compose up --build
     ```
+
+Notes:
+
+1. asynchronous background tasks for analytics on url clicks (frequency etc.)
+2. in-memory cache for frequent URLs (change to a Redis cache for a more performant service)
+3. better algorithm for a short code generation
+
 API:
 
 **HTTP Method:** `GET`
