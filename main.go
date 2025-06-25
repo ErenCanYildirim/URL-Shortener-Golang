@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 )
@@ -46,11 +47,11 @@ type AnalyticsEvent struct {
 type URLShortener struct {
 	db               *sql.DB
 	analyticsChannel chan AnalyticsEvent
-	cache            sync.Map
+	redisClient      *redis.Client
 	wg               sync.WaitGroup
 }
 
-func NewURLShortener(dbURL string) (*URLShortener, error) {
+func NewURLShortener(dbURL string, redisAddr string) (*URLShortener, error) {
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, err
@@ -64,9 +65,23 @@ func NewURLShortener(dbURL string) (*URLShortener, error) {
 	db.SetMaxIdleConns(15)
 	db.SetConnMaxLifetime(10 * time.Minute)
 
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: "",
+		DB:       0,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = rdb.Ping(ctx).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to ping Redis: %w", err)
+	}
+
 	us := &URLShortener{
 		db:               db,
 		analyticsChannel: make(chan AnalyticsEvent, 1000),
+		redisClient:      rdb,
 	}
 
 	if err := us.createTables(); err != nil {
@@ -236,15 +251,16 @@ func (us *URLShortener) ShortenURL(ctx context.Context, longURL string) (*URL, e
 		return nil, fmt.Errorf("invalid URL format")
 	}
 
-	//Use index on long_url to check for existing url
 	var existingURL URL
 	err := us.db.QueryRowContext(ctx,
 		"SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE long_url = $1",
 		longURL).Scan(&existingURL.ID, &existingURL.ShortCode, &existingURL.LongURL, &existingURL.Clicks, &existingURL.CreatedAt)
 
 	if err == nil {
-		us.cache.Store(existingURL.ShortCode, &existingURL)
+		urlJSON, _ := json.Marshal(existingURL)
+		us.redisClient.Set(ctx, existingURL.ShortCode, urlJSON, 24*time.Hour)
 		return &existingURL, nil
+
 	}
 
 	shortCode, err := us.generateUniqueShortCode(ctx)
@@ -262,19 +278,26 @@ func (us *URLShortener) ShortenURL(ctx context.Context, longURL string) (*URL, e
 		return nil, err
 	}
 
-	us.cache.Store(newURL.ShortCode, &newURL)
+	newURLJSON, _ := json.Marshal(newURL)
+	us.redisClient.Set(ctx, newURL.ShortCode, newURLJSON, 24*time.Hour)
 	return &newURL, nil
 }
 
 func (us *URLShortener) GetURL(ctx context.Context, shortCode string) (*URL, error) {
-	if cached, ok := us.cache.Load(shortCode); ok {
-		if urlRecord, ok := cached.(*URL); ok {
-			return urlRecord, nil
+	cachedURLJSON, err := us.redisClient.Get(ctx, shortCode).Result()
+	if err == nil {
+		var urlRecord URL
+		jsonErr := json.Unmarshal([]byte(cachedURLJSON), &urlRecord)
+		if jsonErr == nil {
+			return &urlRecord, nil
 		}
+		log.Printf("Error unmarshaling cached URL for %s: %v", shortCode, jsonErr)
+	} else if err != redis.Nil {
+		log.Printf("Error getting from Redis for %s: %v", shortCode, err)
 	}
 
 	var urlRecord URL
-	err := us.db.QueryRowContext(ctx,
+	err = us.db.QueryRowContext(ctx,
 		"SELECT id, short_code, long_url, clicks, created_at FROM urls WHERE short_code = $1",
 		shortCode).Scan(&urlRecord.ID, &urlRecord.ShortCode, &urlRecord.LongURL, &urlRecord.Clicks, &urlRecord.CreatedAt)
 
@@ -285,7 +308,8 @@ func (us *URLShortener) GetURL(ctx context.Context, shortCode string) (*URL, err
 		return nil, err
 	}
 
-	us.cache.Store(shortCode, &urlRecord)
+	urlJSON, _ := json.Marshal(urlRecord)
+	us.redisClient.Set(ctx, shortCode, urlJSON, 24*time.Hour)
 	return &urlRecord, nil
 }
 
@@ -517,6 +541,12 @@ func (us *URLShortener) Close() error {
 	close(us.analyticsChannel)
 	us.wg.Wait()
 
+	if us.redisClient != nil {
+		if err := us.redisClient.Close(); err != nil {
+			log.Printf("Error closing Redis client: %v", err)
+		}
+	}
+
 	return us.db.Close()
 }
 
@@ -526,7 +556,12 @@ func main() {
 		log.Fatal("DATABASE_URL environment variable is required")
 	}
 
-	shortener, err := NewURLShortener(dbURL)
+	redisAddr := os.Getenv("REDIS_ADDR") // Get Redis address
+	if redisAddr == "" {
+		log.Fatal("REDIS_ADDR environment variable is required")
+	}
+
+	shortener, err := NewURLShortener(dbURL, redisAddr)
 	if err != nil {
 		log.Fatal("Failed to initialize URL shortener:", err)
 	}

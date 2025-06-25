@@ -1,39 +1,28 @@
 # URL-Shortener-Golang
 
-Production ready URL-Shortener service built with golang.
+A production-ready URL shortener service built with Go, PostgreSQL and Redis.
 
-If you want to run it locally as a playground then switch to the local branch, it uses sqlite.
+For local development or experimentation, switch to the local branch — it uses SQLite for simplicity. The main branch is optimized for production with PostgreSQL and connection pooling to ensure reliability and performance.
 
-The main branch uses postgresql with connection pooling to ensure prod-grade stability.
+# How to run
 
-How to run:
-    1. Create an .env file with POSTGRES_PASSWORD, POSTGRES_PORT, APP_PORT
-    2. Start with ```bash
-        docker-compose up --build
-    ```
+1. Create a ```.env```file with the following vars: `POSTGRES_PASSWORD`, `POSTGRES_PORT` and `APP_PORT`.
+2. Launch service with `docker-compose up --build`.
 
-Notes:
+# API Endpoints
 
-1. asynchronous background tasks for analytics on url clicks (frequency etc.)
-2. in-memory cache for frequent URLs (change to a Redis cache for a more performant service)
-3. better algorithm for a short code generation
+`GET /health` — Check service health
 
-API:
+`GET /api/stats/{shortCode}` — Retrieve stats for a shortened URL
 
-**HTTP Method:** `GET`
-**URL Path:** `/health`
+`GET /api/list` — List all shortened URLs
 
-**HTTP Method:** `GET`
-**URL Path:** `/api/stats/{shortCode}`
+`GET /{shortCode}` — Redirect to the original URL
 
-**HTTP Method:** `GET`
-**URL Path:** `/api/list`
+`POST /api/shorten` — Create a new shortened URL
 
-**HTTP Method:** `GET`
-**URL Path:** `/{shortCode}`
+# Future extensions
 
-**HTTP Method:** `POST`
-**URL Path:** `/api/shorten`
+Add transaction safety for critical database operations
 
-Missing:
-    -> Transaction safety for some db-operations
+Improve short code generation algorithm for uniqueness and efficiency

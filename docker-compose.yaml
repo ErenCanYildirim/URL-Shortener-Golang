@@ -20,13 +20,29 @@ services:
     networks:
       - urlshortener-network
 
+  redis:
+    image: redis:7-alpine 
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    networks:
+      - urlshortener-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  
   url-shortener:
     build: .
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://urlshortener:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/urlshortener?sslmode=disable
+      REDIS_ADDR: redis:6379
       PORT: 8080
       BASE_URL: ${BASE_URL:-http://localhost:8080}
     ports:
